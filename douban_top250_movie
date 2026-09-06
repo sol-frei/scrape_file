@@ -1,0 +1,243 @@
+import requests
+from lxml import etree
+import re
+import csv
+import json
+from enum import Enum
+
+from openpyxl import Workbook #用于创建新的工作簿
+from openpyxl.styles import Font,Border,Side
+from peewee import MySQLDatabase,Model,AutoField,IntegerField,CharField,DecimalField
+
+#Peewee
+
+db = MySQLDatabase(
+    database="spider_db" , # database表示要连接的数据的名字，在Mysql中Database也等同于Schema,
+    # 但是Database会更多用来指物理储存的层面，Schema用来描述逻辑结构
+    host='localhost',#host表示ip地址，localhost表示本机
+    port =3306 ,#表示端口号
+    user='admin',#表示连接数据库使用的账号
+    password=''
+)
+
+class Movie(Model):  # 创建对应电影数据表的类，Movie类必须继承自Model类,ORM才能发挥作用
+    id = AutoField()
+    rank = IntegerField(unique=True)  # db_column="rank"手动指定映射关系
+    title = CharField(max_length=100, unique=True)
+    score = DecimalField(max_digits=2, decimal_places=1)
+    year = IntegerField()
+    rating_count = DecimalField()
+    class Meta:
+        database = db  # 模型操作数据库的前置条件
+        db_table = 'top_250_db'
+
+class MovieDirector(Model):
+        id = AutoField(primary_key=True)
+        movie_id= IntegerField()
+        director= CharField(max_length=100)
+
+        class Meta:
+            database = db  # 模型操作数据库的前置条件
+            db_table = 'top_douban250_directors'
+
+
+class WriteToType(Enum):
+    CSV=1
+    JSON=2
+    EXCEL=3
+    MYSQL=4
+
+url = "https://movie.douban.com/top250"
+headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0"}
+
+#写入MySQL
+def write_movies_to_mysql(movies_):
+    try:
+        db.connect()  # 连接。连接成功connet方法不会返回任何值。失败的话会抛出异常
+    except  Exception as e:
+        print(f'数据库连接失败：{e}')
+        return #用return提前退出函数
+    Movie.delete().execute()
+    MovieDirector.delete().execute()
+    print('数据删除成功')
+    #开启事务
+    with db.atomic():
+        for movie_dic in movies_:
+            movie =Movie.create(rank=movie_dic['排名'],
+                                title=movie_dic['标题'],
+                                score=movie_dic['评分'],
+                                year=movie_dic['年份'],
+                                rating_count=movie_dic['评价人数'],)#没有人为捕获create方法抛出的异常，因为这样db.atomic才会在异常出现之后自动回滚
+            print(f"电影{movie.title}写入成功，id是：{movie.id}")
+            diector_list = movie_dic['导演']
+            for direct_name in diector_list:
+                director_obj = MovieDirector.create(movie_id=movie.id,director=direct_name)
+                print(f"导演{director_obj.director}写入成功，id是：{director_obj.id}")
+    db.close()
+    print(f'是否已关闭连接：{db.is_closed()}')
+
+
+#写入Excel
+def write_movies_to_excel(movies_):
+    wb = Workbook()#创建工作簿
+    ws =wb.active#获取当前活动工作表
+    ws.title="豆瓣top250电影"
+
+    #设置表头行
+    excel_headers = ['排名', '标题', '评分', '年份', '评价人数', '导演']
+    thin_side = Side(style='thin')#把边的样式设置为细线条
+
+    for col_num,header in enumerate(excel_headers,1): #col_num列号，headers列名
+        cell = ws.cell(row=1,column=col_num)
+        cell.value = header
+        cell.font = Font(bold=True)
+        cell.border = Border(top=thin_side, bottom=thin_side, left=thin_side, right=thin_side)
+
+    #电影数据
+    for movie in movies_:
+        ws.append(list(movie.values())) #values返回的是对象，不是列表或者元祖
+    #保存Excel
+
+    wb.save('豆瓣top250电影.xlsx')
+    print("已成功写入w2_douban250.xlsx")
+
+
+
+#写入csv
+def write_movies_to_csv(movies_):
+    with open('w2_douban250.csv',"w",newline='',encoding="utf-8-sig") as f :
+        fieldnames=['排名','标题','评分','年份','评价人数','导演']
+        writer= csv.DictWriter(f,fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(movies_)
+    print("已成功写入w2_douban250.csv")
+
+#写入json
+def write_movies_to_json(movies_):
+    with open('w2_douban250.json',"w",newline='',encoding="utf-8") as f :
+        json.dump(movies_,f,ensure_ascii=False,indent=2)
+
+    print("已成功写入w2_douban250.json")
+
+ # 获取标题
+def get_title(item):
+
+    title_elements = item.xpath(".//span[@class='title'][1]/text()")
+    # print(title_elements)
+    title = title_elements[0] if title_elements else None
+    return title
+
+#获取排名
+def get_rank(item):
+    rank_elements = item.xpath(".//div[@class='pic']/em/text()")
+    rank_text = rank_elements[0] if rank_elements else None
+
+    rank_match = re.search(r'\d+', rank_text)
+    rank = rank_match.group() if rank_match else None
+    return rank
+#获取评分
+def get_score(item):
+    score_elements = item.xpath(".//span[@class='rating_num']/text()")
+    score = score_elements[0] if score_elements else None
+    return score
+
+#获取年份
+def get_year(item):
+    year_elements = item.xpath(".//div[@class='bd']/p[1]/text()")
+    year_text = year_elements[1] if year_elements else None
+    # 获取数字
+    year_match = re.search(r'\d+', year_text)
+    year = year_match.group() if year_match else None
+    return year
+#获取评价人数
+def get_people_count(item):
+    rating_peoplelists = item.xpath(".//div[@class='bd']//span[4]/text()")
+    rating_people = rating_peoplelists[0] if rating_peoplelists else None
+    # 获取数字
+    people_match = re.search(r'\d+', rating_people)
+    people_count = people_match.group() if people_match else None
+    return people_count
+#获取导演名字
+def get_director_list(item):
+    director_elements = item.xpath(".//div[@class='bd']/p[1]/text()")
+    director_text = director_elements[0].strip() if director_elements else None
+
+    director_match = re.search(r'导演[：:]\s*(.*?)((\s{2,}主)|(\.{3}))', director_text)
+
+    director_text_ = director_match.group(1) if director_match else None
+
+    director_list = director_text_.split(" / ")
+    return director_list
+# 创建电影信息字典
+def create_movie_dict(rank, title, score, year, people_count, director_list,write_to):
+    if write_to ==  WriteToType.JSON or   write_to ==WriteToType.MYSQL:
+        director_value = director_list
+    else:
+        director_value =",".join(director_list)
+    movie_dict = {
+        "排名": rank,
+        "标题": title,
+        "评分": score,
+        "年份": year,
+        "评价人数": people_count,
+        "导演": director_value
+    }
+    return movie_dict
+
+#遍历电影列表并提取信息
+def process_movies_items(movie_item_list,movies,write_to):
+    for item in movie_item_list:
+        # 获取标题
+        title = get_title(item)
+        # 获取评分
+        score = get_score(item)
+        # 获取排名
+        rank = get_rank(item)
+        # 获取年份
+        year = get_year(item)
+        # 获取评价人数
+        people_count = get_people_count(item)
+        # 获取导演名字
+        director_list = get_director_list(item)
+        movie_dict = create_movie_dict(rank, title, score, year, people_count, director_list,write_to)
+        movies.append(movie_dict)
+        #print(f"{movie_dict}")
+    return movies
+
+# 获取HTML内容
+def get_html_content(url_, start_=0):
+    page_url = f"{url_}?start={start_}"
+    response = requests.get(page_url, headers=headers)
+    response.raise_for_status()
+    html_content = response.text
+    return html_content
+
+def scrape_douban250_movies(write_to):
+    movies = []
+    try:
+        for start in range(0, 250, 25):
+            html = get_html_content(url, start)
+            tree = etree.HTML(html)
+            item_list = tree.xpath('//div[@class="item"]')
+            movies =process_movies_items(item_list, movies,write_to)
+
+        if write_to == WriteToType.CSV:
+          write_movies_to_csv(movies)
+        elif write_to == WriteToType.JSON:
+          write_movies_to_json(movies)
+        elif write_to == WriteToType.EXCEL:
+          write_movies_to_excel(movies)
+        elif write_to == WriteToType.MYSQL:
+          write_movies_to_mysql(movies)
+        else:
+            print(f'未实现的写入类型{write_to}')
+
+    except requests.RequestException as e:
+        print(f"请求失败: {e}")
+    except Exception as e:
+        print(f"发生错误: {e}")
+
+
+
+if __name__ == "__main__":
+    scrape_douban250_movies(WriteToType.MYSQL)
